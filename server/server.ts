@@ -5,6 +5,9 @@ import jwt from 'jsonwebtoken';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'node:fs';
+import dotenv from 'dotenv';
+
+dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -14,8 +17,18 @@ app.use(express.json());
 
 const JWT_SECRET = process.env.JWT_SECRET || 'brovai-taskflow-jwt-secret-2026';
 const JWT_EXPIRES = '8h';
-const DEFAULT_ADMIN_PASSWORD = process.env.DEFAULT_ADMIN_PASSWORD ;
-const DEFAULT_USER_PASSWORD = process.env.DEFAULT_USER_PASSWORD ;
+
+const DEFAULT_ADMIN_PASSWORD = process.env.DEFAULT_ADMIN_PASSWORD;
+
+if (!DEFAULT_ADMIN_PASSWORD) {
+  throw new Error('DEFAULT_ADMIN_PASSWORD is not configured');
+}
+
+const DEFAULT_USER_PASSWORD = process.env.DEFAULT_USER_PASSWORD;
+
+if (!DEFAULT_USER_PASSWORD) {
+  throw new Error('DEFAULT_USER_PASSWORD is not configured');
+}
 
 // Ensure data directory exists
 const DATA_DIR = path.resolve(process.cwd(), 'data');
@@ -243,6 +256,14 @@ function mapUser(row: any) {
   return { ...row, is_active: row.is_active === 1 };
 }
 
+async function assignDefaultPassword(userID: string,role: string)
+{
+  const password = role === 'Admin' ? DEFAULT_ADMIN_PASSWORD : DEFAULT_USER_PASSWORD;
+  const hash = await bcrypt.hash(password, 10);
+  db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, userID);
+}
+
+
 // ==========================================
 // USERS ROUTES
 // ==========================================
@@ -251,9 +272,13 @@ app.get('/api/users', (_req, res) => {
   res.json(rows.map(r => { const { password_hash, ...safe } = r; return { ...safe, is_active: r.is_active === 1 }; }));
 });
 
-app.put('/api/users/:id', (req, res) => {
+app.put('/api/users/:id', async(req, res) => {
   const { id } = req.params;
   const u = req.body;
+
+  //check if this is a new user ( no password set yet)
+  const existingUser = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(id) as any;
+  const isNewUser = !existingUser || !existingUser.password_hash;
   db.prepare(`
     INSERT INTO users (id, first_name, last_name, email, role, is_active, created_at, updated_at)
     VALUES (@id, @first_name, @last_name, @email, @role, @is_active, @created_at, @updated_at)
@@ -265,6 +290,13 @@ app.put('/api/users/:id', (req, res) => {
       is_active = excluded.is_active,
       updated_at = excluded.updated_at
   `).run({ ...u, id, is_active: u.is_active ? 1 : 0 });
+
+  //Assign defalut pwd if this is new user
+  if(isNewUser)
+  {
+    await assignDefaultPassword(id,u.role);
+  }
+
   res.json({ ok: true });
 });
 
