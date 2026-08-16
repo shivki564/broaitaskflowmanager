@@ -1,37 +1,20 @@
-Architecture :
-┌───────────────────────────────────────────────┐
-│                  Frontend                     │
-│                                               │
-│ React 19 + TypeScript                         │
-│ Vite + Tailwind CSS                           │
-│                                               │
-│ src/App.tsx                                   │
-│ src/components/                               │
-└──────────────────────┬────────────────────────┘
-                       │
-                       │ HTTP REST API
-                       │ JSON
-                       ▼
-┌───────────────────────────────────────────────┐
-│                  Backend                      │
-│                                               │
-│ Express + TypeScript                          │
-│ server/server.ts                              │
-│                                               │
-│ JWT Authentication                            │
-│ bcrypt Password Hashing                       │
-│ REST API Endpoints                             │
-└──────────────────────┬────────────────────────┘
-                       │
-                       │ SQL Queries
-                       ▼
-┌───────────────────────────────────────────────┐
-│                 Database                      │
-│                                               │
-│ SQLite                                        │
-│                                               │
-│ taskflow.db                                   │
-└───────────────────────────────────────────────┘
+Architecture : 
+
+Frontend :
+React 19
+TypeScript
+Vite
+Tailwind CSS
+
+Backend :
+Node.js
+Express
+TypeScript
+JWT
+bcrypt
+
+Database :
+SQLite
 ## Run Locally
 
 **Prerequisites:**  Node.js
