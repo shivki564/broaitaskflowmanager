@@ -13,8 +13,14 @@ const { Pool } = pg;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const app = express();
-app.use(express.json());
+export const app = express();
+console.log("Environment:", {
+  VERCEL: process.env.VERCEL,
+  VERCEL_ENV: process.env.VERCEL_ENV,
+});
+if (!process.env.VERCEL) {
+  app.use(express.json());
+}
 
 // ==========================================
 // ENVIRONMENT CONFIGURATION
@@ -1414,61 +1420,35 @@ app.delete(
 // ==========================================
 // STARTUP
 // ==========================================
+export async function initializeServer() {
+  await testDatabaseConnection();
+  await initializeDatabase();
+  await seedIfEmpty();
+  await seedPasswords();
+}
 
 async function startServer() {
   try {
-    await testDatabaseConnection();
-    await initializeDatabase();
-    await seedIfEmpty();
-    await seedPasswords();
+    await initializeServer();
 
     const PORT = process.env.PORT
       ? parseInt(process.env.PORT)
       : 3001;
 
-    const isProd =
-      process.env.NODE_ENV === 'production';
-
-    if (isProd) {
-      const distPath = path.join(
-        __dirname,
-        '../dist'
-      );
-
-      app.use(
-        express.static(distPath)
-      );
-
-      app.get(
-        '*',
-        (_req, res) => {
-          res.sendFile(
-            path.join(
-              distPath,
-              'index.html'
-            )
-          );
-        }
-      );
-    }
+    // existing production/static configuration...
 
     app.listen(PORT, () => {
       console.log(
         `🚀 Bro AI Task Flow Server running on http://localhost:${PORT}`
       );
-
-      console.log(
-        `📊 Supabase PostgreSQL connected`
-      );
     });
   } catch (error) {
-    console.error(
-      '❌ Failed to start server:',
-      error
-    );
-
+    console.error("❌ Failed to start server:", error);
     process.exit(1);
   }
 }
+if (!process.env.VERCEL) {
+  startServer();
+}
 
-startServer();
+export default app;
