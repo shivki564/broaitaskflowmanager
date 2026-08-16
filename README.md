@@ -1,19 +1,19 @@
-Architecture : 
+## Architecture : 
 
-Frontend :
+## Frontend :
 React 19
 TypeScript
 Vite
 Tailwind CSS
 
-Backend :
+## Backend :
 Node.js
 Express
 TypeScript
 JWT
 bcrypt
 
-Database :
+## Database :
 SQLite
 ## Run Locally
 
