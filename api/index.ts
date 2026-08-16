@@ -1,4 +1,4 @@
-import app, { initializeServer } from "../server/server";
+import app, { initializeServer } from "../server/server.js";
 
 let initializationPromise: Promise<void> | null = null;
 
