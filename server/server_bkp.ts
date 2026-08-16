@@ -1,289 +1,428 @@
-import express, { Request, Response } from 'express';
-import {
-  getDb,
-  getAll,
-  getById,
-  upsert,
-  remove,
-  getUserByEmail,
-  seedIfEmpty,
-  clearDatabase,
-  getDatabaseStats,
-  DB_FILE_PATH
-} from './db';
+import express from 'express';
+import Database from 'better-sqlite3';
+import bcrypt from 'bcrypt';
+import jwt from 'jsonwebtoken';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import fs from 'node:fs';
+import dotenv from 'dotenv';
+
+dotenv.config();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = process.env.PORT || 3001;
-
-// Middlewares
 app.use(express.json());
 
-// CORS Middleware
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
-  if (req.method === 'OPTIONS') {
-    res.sendStatus(200);
-    return;
-  }
-  next();
-});
+const JWT_SECRET = process.env.JWT_SECRET || 'brovai-taskflow-jwt-secret-2026';
+const JWT_EXPIRES = '8h';
 
-// Real-time SSE (Server-Sent Events) Clients Registry
-type SSEClient = {
-  id: number;
-  res: Response;
-};
-let clients: SSEClient[] = [];
-let nextClientId = 1;
+const DEFAULT_ADMIN_PASSWORD = process.env.DEFAULT_ADMIN_PASSWORD;
 
-function broadcast(event: { type: string; collection?: string; action?: string; id?: string; data?: any }) {
-  const payload = `data: ${JSON.stringify(event)}\n\n`;
-  clients.forEach(client => {
-    try {
-      client.res.write(payload);
-    } catch (e) {
-      // Client disconnected
-    }
-  });
+if (!DEFAULT_ADMIN_PASSWORD) {
+  throw new Error('DEFAULT_ADMIN_PASSWORD is not configured');
 }
 
-// -------------------------------------------------------------
-// Realtime SSE endpoint
-// -------------------------------------------------------------
-app.get('/api/events', (req: Request, res: Response) => {
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.flushHeaders();
+const DEFAULT_USER_PASSWORD = process.env.DEFAULT_USER_PASSWORD;
 
-  const clientId = nextClientId++;
-  const client: SSEClient = { id: clientId, res };
-  clients.push(client);
+if (!DEFAULT_USER_PASSWORD) {
+  throw new Error('DEFAULT_USER_PASSWORD is not configured');
+}
 
-  // Send initial ping
-  res.write(`data: ${JSON.stringify({ type: 'connected', clientId })}\n\n`);
+// Ensure data directory exists
+const DATA_DIR = path.resolve(process.cwd(), 'data');
+if (!fs.existsSync(DATA_DIR)) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+}
 
-  req.on('close', () => {
-    clients = clients.filter(c => c.id !== clientId);
+
+// ==========================================
+// DATABASE SETUP
+// ==========================================
+const db = new Database(path.join(DATA_DIR, 'taskflow.db'));
+db.pragma('journal_mode = WAL');
+db.pragma('foreign_keys = ON');
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    first_name TEXT NOT NULL,
+    last_name TEXT NOT NULL,
+    email TEXT NOT NULL UNIQUE,
+    role TEXT NOT NULL CHECK(role IN ('Admin', 'Team Member')),
+    is_active INTEGER NOT NULL DEFAULT 1,
+    password_hash TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS projects (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL,
+    owner_id TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS tasks (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('TO_DO', 'IN_PROGRESS', 'BLOCKED', 'DONE')),
+    project_id TEXT NOT NULL,
+    priority TEXT NOT NULL CHECK(priority IN ('LOW', 'MEDIUM', 'HIGH', 'CRITICAL')),
+    end_date TEXT NOT NULL,
+    assigned_to TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS comments (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    comment_text TEXT NOT NULL,
+    commented_by TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
+`);
+
+// ==========================================
+// SEED INITIAL DATA (runs once if DB is empty)
+// ==========================================
+function seedIfEmpty() {
+  const userCount = (db.prepare('SELECT COUNT(*) as count FROM users').get() as any).count;
+  if (userCount > 0) return;
+
+  console.log('Seeding initial data into SQLite...');
+
+  const insertUser = db.prepare(`
+    INSERT OR IGNORE INTO users (id, first_name, last_name, email, role, is_active, created_at, updated_at)
+    VALUES (@id, @first_name, @last_name, @email, @role, @is_active, @created_at, @updated_at)
+  `);
+  const insertProject = db.prepare(`
+    INSERT OR IGNORE INTO projects (id, name, description, owner_id, created_at)
+    VALUES (@id, @name, @description, @owner_id, @created_at)
+  `);
+  const insertTask = db.prepare(`
+    INSERT OR IGNORE INTO tasks (id, title, description, status, project_id, priority, end_date, assigned_to, created_by, created_at, updated_at)
+    VALUES (@id, @title, @description, @status, @project_id, @priority, @end_date, @assigned_to, @created_by, @created_at, @updated_at)
+  `);
+  const insertComment = db.prepare(`
+    INSERT OR IGNORE INTO comments (id, task_id, comment_text, commented_by, created_at)
+    VALUES (@id, @task_id, @comment_text, @commented_by, @created_at)
+  `);
+
+  const seedTx = db.transaction(() => {
+    [
+      { id: "u1", first_name: "Alex", last_name: "Robinson", email: "alex@brovai.com", role: "Admin", is_active: 1, created_at: "2026-01-10T09:00:00Z", updated_at: "2026-01-10T09:00:00Z" },
+      { id: "u2", first_name: "Jordan", last_name: "Smith", email: "jordan@brovai.com", role: "Team Member", is_active: 1, created_at: "2026-02-15T10:30:00Z", updated_at: "2026-02-15T10:30:00Z" },
+      { id: "u3", first_name: "Maria", last_name: "Gomez", email: "maria@brovai.com", role: "Team Member", is_active: 1, created_at: "2026-03-01T11:00:00Z", updated_at: "2026-03-01T11:00:00Z" },
+      { id: "u4", first_name: "Sam", last_name: "Taylor", email: "sam@brovai.com", role: "Team Member", is_active: 1, created_at: "2026-03-20T14:00:00Z", updated_at: "2026-03-20T14:00:00Z" },
+      { id: "u5", first_name: "Jessica", last_name: "Chen", email: "jessica@brovai.com", role: "Team Member", is_active: 0, created_at: "2026-04-05T16:20:00Z", updated_at: "2026-04-05T16:20:00Z" }
+    ].forEach(u => insertUser.run(u));
+
+    [
+      { id: "p1", name: "Project Nebula", description: "Next-gen distributed cloud platform scaling infrastructure seamlessly.", owner_id: "u1", created_at: "2026-01-15T08:00:00Z" },
+      { id: "p2", name: "API V3 Core", description: "Rebuilding our core microservices endpoints for faster payloads.", owner_id: "u4", created_at: "2026-03-10T08:00:00Z" }
+    ].forEach(p => insertProject.run(p));
+
+    [
+      { id: "t1", title: "OAuth2 Implementation", description: "Integrate fully secure OAuth2 and JWT flow for third-party client integrations and secure SSO access.", status: "IN_PROGRESS", project_id: "p1", priority: "CRITICAL", end_date: "2026-07-05", assigned_to: "u2", created_by: "u1", created_at: "2026-06-15T10:00:00Z", updated_at: "2026-06-20T11:30:00Z" },
+      { id: "t2", title: "PostgreSQL Index Optimization", description: "Identify slow querying workloads, add composite indexes, and optimize query analyzer performance under peak loads.", status: "BLOCKED", project_id: "p1", priority: "HIGH", end_date: "2026-06-20", assigned_to: "u3", created_by: "u1", created_at: "2026-06-10T09:00:00Z", updated_at: "2026-06-22T14:00:00Z" },
+      { id: "t3", title: "UI Layout Refactoring", description: "Convert old navigation views into highly sleek, modern CSS layouts with beautiful glassmorphism.", status: "DONE", project_id: "p1", priority: "MEDIUM", end_date: "2026-06-23", assigned_to: "u4", created_by: "u1", created_at: "2026-06-18T10:00:00Z", updated_at: "2026-06-23T17:00:00Z" },
+      { id: "t4", title: "User Documentation Wiki", description: "Draft official developer wiki and end-user onboarding documentation for Project Nebula launch.", status: "TO_DO", project_id: "p1", priority: "LOW", end_date: "2026-07-15", assigned_to: "u1", created_by: "u1", created_at: "2026-06-20T08:00:00Z", updated_at: "2026-06-20T08:00:00Z" },
+      { id: "t5", title: "Setup API Gateway Routing", description: "Establish automated reverse-proxy configurations, load-balancers, and path-based API gateway routing tables.", status: "TO_DO", project_id: "p2", priority: "HIGH", end_date: "2026-07-12", assigned_to: "u2", created_by: "u4", created_at: "2026-06-21T09:00:00Z", updated_at: "2026-06-21T09:00:00Z" },
+      { id: "t6", title: "Implement JWT Authentication", description: "Build robust stateless JSON Web Token session validation middleware with asymmetric signature keys.", status: "DONE", project_id: "p2", priority: "CRITICAL", end_date: "2026-06-24", assigned_to: "u4", created_by: "u4", created_at: "2026-06-19T11:00:00Z", updated_at: "2026-06-24T12:00:00Z" }
+    ].forEach(t => insertTask.run(t));
+
+    [
+      { id: "c1", task_id: "t1", comment_text: "Standardizing on OAuth2 authorization code flow with PKCE for security.", commented_by: "u2", created_at: "2026-06-21T14:30:00Z" },
+      { id: "c2", task_id: "t2", comment_text: "Blocked on disk quota expansion and admin database level execution grants.", commented_by: "u3", created_at: "2026-06-22T15:20:00Z" },
+      { id: "c3", task_id: "t2", comment_text: "I am reviewing the storage requests today. Hang tight, Maria.", commented_by: "u1", created_at: "2026-06-23T09:10:00Z" }
+    ].forEach(c => insertComment.run(c));
   });
-});
 
-// -------------------------------------------------------------
-// System & Health Endpoints
-// -------------------------------------------------------------
-app.get('/api/health', (req: Request, res: Response) => {
-  try {
-    const stats = getDatabaseStats();
-    res.json({
-      status: 'ok',
-      engine: 'SQLite (Server-side)',
-      databaseFile: DB_FILE_PATH,
-      stats
-    });
-  } catch (err: any) {
-    res.status(500).json({ status: 'error', error: err.message });
-  }
-});
+  seedTx();
+  console.log('Seed complete.');
+}
 
-app.get('/api/stats', (req: Request, res: Response) => {
-  try {
-    const stats = getDatabaseStats();
-    res.json(stats);
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
+seedIfEmpty();
 
-// -------------------------------------------------------------
-// Auth Endpoints
-// -------------------------------------------------------------
-const DEFAULT_PASSWORDS: Record<string, string> = {
-  'Admin': 'admin123',
-  'Team Member': 'user123'
-};
-
-app.post('/api/auth/login', (req: Request, res: Response) => {
-  try {
-    const { email, password } = req.body;
-    if (!email || !password) {
-      res.status(400).json({ error: 'Email and password are required.' });
-      return;
-    }
-
-    const user = getUserByEmail(email);
-    if (!user) {
-      res.status(401).json({ error: 'User not found. Please check your email.' });
-      return;
-    }
-
-    if (!user.is_active) {
-      res.status(403).json({ error: 'This account is deactivated. Please contact an administrator.' });
-      return;
-    }
-
-    const expectedPassword = user.password || DEFAULT_PASSWORDS[user.role] || 'user123';
-    if (password !== expectedPassword) {
-      res.status(401).json({ error: 'Invalid password. Please try again.' });
-      return;
-    }
-
-    // Generate token
-    const token = Buffer.from(`${user.id}:${Date.now()}:${Math.random()}`).toString('base64');
-    const { password: _, ...safeUser } = user;
-
-    res.json({
-      user: safeUser,
-      token
-    });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// -------------------------------------------------------------
-// Bulk Data & Seed
-// -------------------------------------------------------------
-app.get('/api/all', (req: Request, res: Response) => {
-  try {
-    const users = getAll('users').map(({ password, ...u }) => u);
-    const projects = getAll('projects');
-    const tasks = getAll('tasks');
-    const comments = getAll('comments');
-
-    res.json({ users, projects, tasks, comments });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/seed', (req: Request, res: Response) => {
-  try {
-    seedIfEmpty();
-    broadcast({ type: 'reload' });
-    res.json({ success: true, message: 'Database seeded if needed.' });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/clear', (req: Request, res: Response) => {
-  try {
-    clearDatabase();
-    broadcast({ type: 'reload' });
-    res.json({ success: true, message: 'Database cleared.' });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// -------------------------------------------------------------
-// Collection CRUD Endpoints
-// -------------------------------------------------------------
-app.get('/api/:collection', (req: Request, res: Response) => {
-  try {
-    const { collection } = req.params;
-    let data = getAll(collection);
-    if (collection === 'users') {
-      data = data.map(({ password, ...u }) => u);
-    }
-    res.json(data);
-  } catch (err: any) {
-    res.status(400).json({ error: err.message });
-  }
-});
-
-app.get('/api/:collection/:id', (req: Request, res: Response) => {
-  try {
-    const { collection, id } = req.params;
-    const item = getById(collection, id);
-    if (!item) {
-      res.status(404).json({ error: 'Not found' });
-      return;
-    }
-    if (collection === 'users') {
-      const { password, ...safeUser } = item;
-      res.json(safeUser);
-      return;
-    }
-    res.json(item);
-  } catch (err: any) {
-    res.status(400).json({ error: err.message });
-  }
-});
-
-app.put('/api/:collection/:id', (req: Request, res: Response) => {
-  try {
-    const { collection, id } = req.params;
-    const body = req.body;
-    upsert(collection, id, body);
-    
-    // Broadcast realtime event
-    broadcast({
-      type: 'change',
-      collection,
-      action: 'upsert',
-      id,
-      data: body
-    });
-
-    res.json({ success: true, id });
-  } catch (err: any) {
-    res.status(400).json({ error: err.message });
-  }
-});
-
-app.post('/api/:collection', (req: Request, res: Response) => {
-  try {
-    const { collection } = req.params;
-    const body = req.body;
-    const id = body.id || `${collection.charAt(0)}_${Date.now()}`;
-    upsert(collection, id, body);
-
-    broadcast({
-      type: 'change',
-      collection,
-      action: 'upsert',
-      id,
-      data: { ...body, id }
-    });
-
-    res.json({ success: true, id });
-  } catch (err: any) {
-    res.status(400).json({ error: err.message });
-  }
-});
-
-app.delete('/api/:collection/:id', (req: Request, res: Response) => {
-  try {
-    const { collection, id } = req.params;
-    remove(collection, id);
-
-    broadcast({
-      type: 'change',
-      collection,
-      action: 'delete',
-      id
-    });
-
-    res.json({ success: true, id });
-  } catch (err: any) {
-    res.status(400).json({ error: err.message });
-  }
-});
-
-// Initialize database schema and initial seed data on startup
+// Add password_hash column to existing databases (idempotent migration)
 try {
-  getDb();
-  seedIfEmpty();
-  console.log(`Server-side SQLite initialized at: ${DB_FILE_PATH}`);
-} catch (err) {
-  console.error('Error during initial DB setup:', err);
+  db.exec(`ALTER TABLE users ADD COLUMN password_hash TEXT`);
+} catch (_) { /* column already exists */ }
+
+// Seed default passwords for any user that doesn't have one yet (runs on every start)
+async function seedPasswords() {
+  const usersWithoutPassword = db.prepare(`SELECT id, role FROM users WHERE password_hash IS NULL`).all() as any[];
+  if (usersWithoutPassword.length === 0) return;
+
+  console.log(`Setting default passwords for ${usersWithoutPassword.length} user(s)...`);
+  const adminHash = await bcrypt.hash(DEFAULT_ADMIN_PASSWORD, 10);
+  const userHash  = await bcrypt.hash(DEFAULT_USER_PASSWORD, 10);
+
+  for (const u of usersWithoutPassword) {
+    const hash = u.role === 'Admin' ? adminHash : userHash;
+    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, u.id);
+  }
+  console.log('─────────────────────────────────────');
+  console.log('  Default passwords assigned securely');
+}
+seedPasswords();
+
+// ==========================================
+// AUTH MIDDLEWARE
+// ==========================================
+function authMiddleware(req: any, res: any, next: any) {
+  const header = req.headers.authorization;
+  if (!header?.startsWith('Bearer ')) return res.status(401).json({ error: 'Unauthorized' });
+  try {
+    req.user = jwt.verify(header.slice(7), JWT_SECRET);
+    next();
+  } catch {
+    res.status(401).json({ error: 'Token expired or invalid' });
+  }
 }
 
-// Start HTTP server
+// Protect all /api/* routes except /api/auth/*
+app.use('/api', (req: any, res: any, next: any) => {
+  if (req.path.startsWith('/auth/')) return next();
+  return authMiddleware(req, res, next);
+});
+
+// ==========================================
+// AUTH ROUTES (public)
+// ==========================================
+app.post('/api/auth/login', async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+
+  const user = db.prepare('SELECT * FROM users WHERE LOWER(email) = LOWER(?)').get(email.trim()) as any;
+  if (!user) return res.status(401).json({ error: 'Invalid email or password' });
+  if (!user.is_active) return res.status(403).json({ error: 'Account is deactivated. Contact admin.' });
+  if (!user.password_hash) return res.status(401).json({ error: 'No password set. Contact your admin.' });
+
+  const valid = await bcrypt.compare(password, user.password_hash);
+  if (!valid) return res.status(401).json({ error: 'Invalid email or password' });
+
+  const token = jwt.sign(
+    { id: user.id, email: user.email, role: user.role },
+    JWT_SECRET,
+    { expiresIn: JWT_EXPIRES }
+  );
+
+  const { password_hash, ...safeUser } = user;
+  res.json({ token, user: { ...safeUser, is_active: user.is_active === 1 } });
+});
+
+app.get('/api/auth/me', authMiddleware, (req: any, res) => {
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id) as any;
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  const { password_hash, ...safeUser } = user;
+  res.json({ ...safeUser, is_active: user.is_active === 1 });
+});
+
+app.post('/api/auth/change-password', authMiddleware, async (req: any, res) => {
+  const { currentPassword, newPassword } = req.body;
+  if (!newPassword || newPassword.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id) as any;
+  if (user.password_hash) {
+    const valid = await bcrypt.compare(currentPassword, user.password_hash);
+    if (!valid) return res.status(401).json({ error: 'Current password is incorrect' });
+  }
+  const hash = await bcrypt.hash(newPassword, 10);
+  db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, req.user.id);
+  res.json({ ok: true });
+});
+
+// Admin: reset any user's password
+app.post('/api/auth/set-password', authMiddleware, async (req: any, res) => {
+  if (req.user.role !== 'Admin') return res.status(403).json({ error: 'Admins only' });
+  const { userId, password } = req.body;
+  if (!password || password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+  const hash = await bcrypt.hash(password, 10);
+  db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, userId);
+  res.json({ ok: true });
+});
+
+// ==========================================
+// HELPERS
+// ==========================================
+function mapUser(row: any) {
+  if (!row) return null;
+  return { ...row, is_active: row.is_active === 1 };
+}
+
+async function assignDefaultPassword(userID: string,role: string)
+{
+  const password = role === 'Admin' ? DEFAULT_ADMIN_PASSWORD : DEFAULT_USER_PASSWORD;
+  const hash = await bcrypt.hash(password, 10);
+  db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, userID);
+}
+
+
+// ==========================================
+// USERS ROUTES
+// ==========================================
+app.get('/api/users', (_req, res) => {
+  const rows = db.prepare('SELECT * FROM users ORDER BY id').all() as any[];
+  res.json(rows.map(r => { const { password_hash, ...safe } = r; return { ...safe, is_active: r.is_active === 1 }; }));
+});
+
+app.put('/api/users/:id', async(req, res) => {
+  const { id } = req.params;
+  const u = req.body;
+
+  //check if this is a new user ( no password set yet)
+  const existingUser = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(id) as any;
+  const isNewUser = !existingUser || !existingUser.password_hash;
+  db.prepare(`
+    INSERT INTO users (id, first_name, last_name, email, role, is_active, created_at, updated_at)
+    VALUES (@id, @first_name, @last_name, @email, @role, @is_active, @created_at, @updated_at)
+    ON CONFLICT(id) DO UPDATE SET
+      first_name = excluded.first_name,
+      last_name = excluded.last_name,
+      email = excluded.email,
+      role = excluded.role,
+      is_active = excluded.is_active,
+      updated_at = excluded.updated_at
+  `).run({ ...u, id, is_active: u.is_active ? 1 : 0 });
+
+  //Assign defalut pwd if this is new user
+  if(isNewUser)
+  {
+    await assignDefaultPassword(id,u.role);
+  }
+
+  res.json({ ok: true });
+});
+
+app.delete('/api/users/:id', (req, res) => {
+  db.prepare('DELETE FROM users WHERE id = ?').run(req.params.id);
+  res.json({ ok: true });
+});
+
+// ==========================================
+// PROJECTS ROUTES
+// ==========================================
+app.get('/api/projects', (_req, res) => {
+  const rows = db.prepare('SELECT * FROM projects ORDER BY created_at').all();
+  res.json(rows);
+});
+
+app.put('/api/projects/:id', (req, res) => {
+  const { id } = req.params;
+  const p = req.body;
+  db.prepare(`
+    INSERT INTO projects (id, name, description, owner_id, created_at)
+    VALUES (@id, @name, @description, @owner_id, @created_at)
+    ON CONFLICT(id) DO UPDATE SET
+      name = excluded.name,
+      description = excluded.description,
+      owner_id = excluded.owner_id
+  `).run({ ...p, id });
+  res.json({ ok: true });
+});
+
+app.delete('/api/projects/:id', (req, res) => {
+  const { id } = req.params;
+  const deleteTx = db.transaction(() => {
+    // Get task ids for this project
+    const taskIds = (db.prepare('SELECT id FROM tasks WHERE project_id = ?').all(id) as any[]).map(r => r.id);
+    // Delete comments for those tasks
+    for (const tid of taskIds) {
+      db.prepare('DELETE FROM comments WHERE task_id = ?').run(tid);
+    }
+    // Delete tasks
+    db.prepare('DELETE FROM tasks WHERE project_id = ?').run(id);
+    // Delete project
+    db.prepare('DELETE FROM projects WHERE id = ?').run(id);
+  });
+  deleteTx();
+  res.json({ ok: true });
+});
+
+// ==========================================
+// TASKS ROUTES
+// ==========================================
+app.get('/api/tasks', (_req, res) => {
+  const rows = db.prepare('SELECT * FROM tasks ORDER BY created_at DESC').all();
+  res.json(rows);
+});
+
+app.put('/api/tasks/:id', (req, res) => {
+  const { id } = req.params;
+  const t = req.body;
+  db.prepare(`
+    INSERT INTO tasks (id, title, description, status, project_id, priority, end_date, assigned_to, created_by, created_at, updated_at)
+    VALUES (@id, @title, @description, @status, @project_id, @priority, @end_date, @assigned_to, @created_by, @created_at, @updated_at)
+    ON CONFLICT(id) DO UPDATE SET
+      title = excluded.title,
+      description = excluded.description,
+      status = excluded.status,
+      project_id = excluded.project_id,
+      priority = excluded.priority,
+      end_date = excluded.end_date,
+      assigned_to = excluded.assigned_to,
+      updated_at = excluded.updated_at
+  `).run({ ...t, id });
+  res.json({ ok: true });
+});
+
+app.delete('/api/tasks/:id', (req, res) => {
+  const { id } = req.params;
+  const deleteTx = db.transaction(() => {
+    db.prepare('DELETE FROM comments WHERE task_id = ?').run(id);
+    db.prepare('DELETE FROM tasks WHERE id = ?').run(id);
+  });
+  deleteTx();
+  res.json({ ok: true });
+});
+
+// ==========================================
+// COMMENTS ROUTES
+// ==========================================
+app.get('/api/comments', (_req, res) => {
+  const rows = db.prepare('SELECT * FROM comments ORDER BY created_at').all();
+  res.json(rows);
+});
+
+app.put('/api/comments/:id', (req, res) => {
+  const { id } = req.params;
+  const c = req.body;
+  db.prepare(`
+    INSERT INTO comments (id, task_id, comment_text, commented_by, created_at)
+    VALUES (@id, @task_id, @comment_text, @commented_by, @created_at)
+    ON CONFLICT(id) DO UPDATE SET
+      comment_text = excluded.comment_text
+  `).run({ ...c, id });
+  res.json({ ok: true });
+});
+
+app.delete('/api/comments/:id', (req, res) => {
+  db.prepare('DELETE FROM comments WHERE id = ?').run(req.params.id);
+  res.json({ ok: true });
+});
+
+// ==========================================
+// START SERVER
+// ==========================================
+const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3001;
+const isProd = process.env.NODE_ENV === 'production';
+
+// In production, serve the Vite-built frontend from /dist
+if (isProd) {
+  const distPath = path.join(__dirname, 'dist');
+  app.use(express.static(distPath));
+  // Fallback: serve index.html for all non-API routes (SPA routing)
+  app.get('*', (_req, res) => {
+    res.sendFile(path.join(distPath, 'index.html'));
+  });
+}
+
 app.listen(PORT, () => {
-  console.log(`🚀 Bro AI Task Flow Server running on http://localhost:${PORT}`);
-  console.log(`📊 SQLite database connected: ${DB_FILE_PATH}`);
+  console.log(`Server running at http://localhost:${PORT} [${isProd ? 'production' : 'development'}]`);
 });
