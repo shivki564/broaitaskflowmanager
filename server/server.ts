@@ -14,6 +14,8 @@ app.use(express.json());
 
 const JWT_SECRET = process.env.JWT_SECRET || 'brovai-taskflow-jwt-secret-2026';
 const JWT_EXPIRES = '8h';
+const DEFAULT_ADMIN_PASSWORD = process.env.DEFAULT_ADMIN_PASSWORD ;
+const DEFAULT_USER_PASSWORD = process.env.DEFAULT_USER_PASSWORD ;
 
 // Ensure data directory exists
 const DATA_DIR = path.resolve(process.cwd(), 'data');
@@ -146,18 +148,15 @@ async function seedPasswords() {
   if (usersWithoutPassword.length === 0) return;
 
   console.log(`Setting default passwords for ${usersWithoutPassword.length} user(s)...`);
-  const adminHash = await bcrypt.hash('admin123', 10);
-  const userHash  = await bcrypt.hash('user123', 10);
+  const adminHash = await bcrypt.hash(DEFAULT_ADMIN_PASSWORD, 10);
+  const userHash  = await bcrypt.hash(DEFAULT_USER_PASSWORD, 10);
 
   for (const u of usersWithoutPassword) {
     const hash = u.role === 'Admin' ? adminHash : userHash;
     db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, u.id);
   }
   console.log('─────────────────────────────────────');
-  console.log('  Default passwords assigned:');
-  console.log('  Admin accounts   → admin123');
-  console.log('  Team members     → user123');
-  console.log('─────────────────────────────────────');
+  console.log('  Default passwords assigned securely');
 }
 seedPasswords();
 
