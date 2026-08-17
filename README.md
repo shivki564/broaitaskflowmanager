@@ -14,7 +14,7 @@ JWT
 bcrypt
 
 ## Database :
-SQLite
+Postgress
 ## Run Locally
 
 **Prerequisites:**  Node.js
